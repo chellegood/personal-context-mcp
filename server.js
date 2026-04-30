@@ -1,6 +1,7 @@
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { randomUUID } from 'crypto';
 import { z } from 'zod';
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -66,7 +67,6 @@ function createServer() {
     async () => {
       const files = await githubFetch(PORTFOLIO_PATH);
       const mdFiles = files.filter((f) => f.type === 'file' && f.name.endsWith('.md'));
-
       const contents = await Promise.all(
         mdFiles.map(async (f) => {
           const file = await githubFetch(`${PORTFOLIO_PATH}/${f.name}`);
@@ -74,7 +74,6 @@ function createServer() {
           return `# ${f.name}\n\n${text}`;
         })
       );
-
       return { content: [{ type: 'text', text: contents.join('\n\n---\n\n') }] };
     }
   );
@@ -85,22 +84,57 @@ function createServer() {
 const app = express();
 app.use(express.json());
 
-const transports = {};
+const transports = new Map();
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
+app.post('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+
+  if (sessionId && transports.has(sessionId)) {
+    const transport = transports.get(sessionId);
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  if (sessionId) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  // New session
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => transports.set(id, transport),
+  });
+
+  transport.onclose = () => {
+    if (transport.sessionId) transports.delete(transport.sessionId);
+  };
+
   const server = createServer();
-  transports[transport.sessionId] = transport;
-  res.on('close', () => delete transports[transport.sessionId]);
   await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
 
-app.post('/messages', async (req, res) => {
-  const transport = transports[req.query.sessionId];
-  if (!transport) return res.status(404).json({ error: 'Session not found' });
-  await transport.handlePostMessage(req, res);
+app.get('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+  if (!transport) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  await transport.handleRequest(req, res);
+});
+
+app.delete('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  const transport = transports.get(sessionId);
+  if (transport) {
+    await transport.close();
+    transports.delete(sessionId);
+  }
+  res.status(204).end();
 });
 
 app.listen(PORT, () => console.log(`MCP server listening on port ${PORT}`));
